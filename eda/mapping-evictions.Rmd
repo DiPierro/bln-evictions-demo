@@ -1,0 +1,267 @@
+---
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r global, include=FALSE}
+# Libraries
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(tidycensus)
+library(shiny)
+library(shinythemes)
+library(leaflet)
+library(tigris)
+
+# Parameters
+
+## Downloaded from https://biglocalnews.org in December 2020
+file_evictions <- here::here("data-raw", "sta_evictions_all_2019_2020.csv")
+    
+## Custom colors selected from http://colorbrewer2.org
+NEW_COLORS <-
+  c(
+    '#ffffd9',
+    '#edf8b1',
+    '#c7e9b4',
+    '#7fcdbb',
+    '#41b6c4',
+    '#1d91c0',
+    '#225ea8',
+    '#253494',
+    '#081d58'
+    )
+
+#===============================================================================
+
+# Code
+
+## Read in data
+## Specify data types to ensure data is parsed correctly
+evictions <- 
+  file_evictions %>% 
+  read_csv(
+    col_types = 
+      cols(
+        location = col_character(),
+        case_number = col_character(),
+        file_date = col_date(format = ""),
+        file_month = col_double(),
+        file_year = col_double(),
+        plaintiff = col_character(),
+        defendant_address = col_character(),
+        defendant_attorney = col_character(),
+        matched_address = col_character(),
+        coordinates_x = col_double(),
+        coordinates_y = col_double(),
+        geoid = col_character(),
+        geocoded_successfully = col_character(),
+        white_nh_pop = col_double(),
+        black_pop = col_double(),
+        indian_pop = col_double(),
+        asian_pop = col_double(),
+        pi_pop = col_double(),
+        other_pop = col_double(),
+        multirace_pop = col_double(),
+        hispanic_pop = col_double(),
+        total_pop = col_double(),
+        pop_pct_white_nh = col_double(),
+        pop_pct_black = col_double(),
+        pop_pct_hispanic = col_double(),
+        majority_flag = col_character()
+      )
+  ) %>% 
+  filter(
+    !case_number %in% c("19d67576", "19ed136435"),  # Remove problematic case numbers
+    file_date < mdy("08/01/2020")
+  ) %>% 
+  mutate(
+    state_abbrev = str_to_upper(str_sub(location, end = 2)),
+    county = str_to_title(str_sub(location, start = 4)),
+    state_county = str_glue("{county}, {state_abbrev}")
+  )
+
+## Vector of county names for dropdown menu
+lookup <-
+  evictions %>% 
+  filter(
+    !is.na(geoid),
+    state_county != "Fulton, GA"
+  ) %>% 
+  distinct(state_county) %>% 
+  pull()
+
+## Vector of state names for filtering
+## Keep only the counties with sufficient data
+states <-
+  evictions %>% 
+  filter(
+    !is.na(geoid),
+    state_county != "Fulton, GA"
+  ) %>% 
+  distinct(state_abbrev) %>% 
+  pull()
+
+## B25008_001 - Total Population in Occupied Housing Units by Tenure
+tract_total <-
+  get_acs(
+    geography = "tract",
+    variables = "B25008_001",
+    state = states,
+    year = 2019,
+    geometry = TRUE
+  ) %>% 
+  rename("total" = estimate)
+
+## B25008_003 - Total Population in Occupied Housing Units by Tenure
+tract_renter <-
+  get_acs(
+    geography = "tract",
+    variables = "B25008_003",
+    state = states,
+    year = 2019,
+    geometry = FALSE
+  ) %>% 
+  rename("renters" = estimate)
+
+## Merge two tibbles above
+merged <-
+  geo_join(tract_total, tract_renter, "GEOID", "GEOID")
+
+```
+
+
+```{r echo=FALSE}
+shinyApp(
+  ui = 
+    fluidPage(
+     theme = shinytheme("paper"),
+     titlePanel("Eviction in select U.S. counties, 2019-2019"),
+     mainPanel(
+       selectInput('var1', 'Choose a county', choices = lookup)
+     ),
+     column(
+       p("Click on the map below to explore eviction rates by Census tract from 2019 through July 2020."),
+       width = 6,
+       leafletOutput("map"),
+       p("Source: The Howard Center for Investigative Journalism and Big Local News, American Community Survey")
+     ),
+     column(
+       width = 6,
+       p("Evictions dropped sharply after the federal eviction moratorium took effect in March 2020, but did not stop completely."),
+       plotOutput("chart"),
+       p("Source: The Howard Center for Investigative Journalism and Big Local News")
+     )
+    ),
+  
+  server = function(input, output, session) {
+   
+    tab <- reactive({ 
+         # Map
+          geoids <-
+            evictions %>%
+            filter(
+              state_county == input$var1,
+              !is.na(geoid),
+              file_date >= mdy("03/27/2020"), # Limit just to cases filed during the moratorium
+              file_date <= mdy("07/24/2020")
+            ) %>%
+            mutate(geoid = as.character(geoid)) %>% 
+            pull(geoid)
+          
+          data <-
+            evictions %>%
+            filter(
+              state_county == input$var1,
+              !is.na(geoid)
+            ) %>%
+            mutate(geoid = as.character(geoid)) %>% 
+            left_join(as_tibble(merged), by = c("geoid" = "GEOID")) %>%
+            group_by(geoid) %>% 
+            summarize(
+              evictions_per_hundred_renter = 100*(n()/renters)
+            ) %>% 
+            distinct(geoid, .keep_all = TRUE) %>%
+            ungroup() %>% 
+            left_join(as_tibble(merged) %>% select(GEOID, geometry), by = c("geoid" = "GEOID")) %>% 
+            left_join(evictions %>% select(geoid, majority_flag), by = c("geoid" = "geoid")) %>%
+            rename("Evictions per hundred renters" = evictions_per_hundred_renter)
+          
+          map_data <- 
+            geo_join(merged %>% filter(GEOID %in% geoids), data, "GEOID", "geoid")
+          
+          qpal <- colorQuantile(palette = NEW_COLORS, domain = map_data$`Evictions per hundred renters`, n = 10)
+          qpal_colors <- unique(qpal(sort(map_data$`Evictions per hundred renters`))) # hex codes
+          qpal_labs <- quantile(map_data$`Evictions per hundred renters`, seq(0, 1, .1)) # depends on n from pal
+          qpal_labs <- paste(round(lag(qpal_labs), 2), round(qpal_labs, 2), sep = " - ")[-1] # first lag is NA
+          
+          map_data %>% 
+            st_transform(crs = "+init=epsg:4326") %>%
+            leaflet(width = "100%") %>%
+            addProviderTiles(provider = "CartoDB.Positron") %>%
+            addPolygons(
+              popup = 
+                ~ str_glue(
+                  "Tract: {name}<br> Evictions per 100 renters: {round(`Evictions per hundred renters`, digits = 2)} <br> Number of renters: {renters}", 
+                  name = str_extract(NAME.x, "^([^,]*)")
+                  ),
+                  stroke = FALSE,
+                  smoothFactor = 0,
+                  fillOpacity = 0.7,
+                  color = ~ qpal(`Evictions per hundred renters`)
+            ) %>%
+            addLegend(
+              "bottomright", 
+              colors = qpal_colors, 
+              labels = qpal_labs,
+              title = "Evictions per 100 renters",
+              opacity = 1
+            ) 
+           
+    })
+    
+    output$map <- renderLeaflet({ 
+       
+       tab()
+      
+    })
+    # Plot showing change over time
+    change <- reactive({
+      evictions %>% 
+        filter(
+          file_date >= ymd("20190101"),
+          state_county == input$var1
+        ) %>%
+        count(state_county, floor_date = floor_date(file_date, unit = "month")) %>% 
+        ggplot() +
+        geom_line(aes(x = floor_date, y = n, group = state_county)) +
+        geom_vline(aes(xintercept = mdy("03/27/2020")), color = "#7fcdbb", size = 1) +
+        geom_label(aes(x = mdy("12/01/2019"), y = 200, label = "Moratorium begins →"), size = 4) +
+        scale_x_date(date_labels = "%b %y") +
+        theme_minimal() +
+        theme(legend.position = "bottom") +
+        labs(
+          title = str_glue("Evictions in {input$var1}, 2019-2020"),
+          x = "Month", 
+          y = "Number of evictions"
+        )
+    })
+    
+    output$chart <- renderPlot({ 
+       
+       change()
+      
+    })
+     
+    
+ },
+
+options = list(height = 1000)
+
+)
+```
